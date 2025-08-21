@@ -88,8 +88,11 @@ docker-compose restart
 ### Пересборка образа
 ```bash
 cd ~/bots/english
+# Останавливает все контейнеры, определенные в docker-compose.yml. Удаляет контейнеры из  памяти
 docker-compose down
+# Пересобирает Docker образ для сервиса english-bot. Флаг --no-cache - игнорирует кэш и собирает образ с нуля
 docker-compose build --no-cache
+# Создает новые контейнеры с чистым образом. Запускает PostgreSQL с пустой базой данных. Запускает бота с обновленным кодом
 docker-compose up -d
 ```
 

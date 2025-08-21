@@ -24,14 +24,14 @@ services:
     environment:
       - POSTGRES_DB=english
       - POSTGRES_USER=assistent
-      - POSTGRES_PASSWORD=44_assistent_l44_322
+      - POSTGRES_PASSWORD=password123
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
     networks:
       - bot-network
     ports:
-      - "5434:5432"  # Используем порт 5434 чтобы не конфликтовать с другими проектами
+      - "5435:5432"  # Используем порт 5434 чтобы не конфликтовать с другими проектами
 
 volumes:
   postgres_data:

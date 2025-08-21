@@ -1,5 +1,6 @@
 import json
 import asyncio
+import os
 from aiogram.types import FSInputFile, InputMediaAudio
 from datetime import datetime, timedelta
 from aiogram import Router, F
@@ -13,7 +14,8 @@ from sqlalchemy.orm import selectinload
 from text.text import (
     welcome_text, return_welcome_text, voice_error_text, start_first_text,
     all_topics_completed_text, openai_error_text, homework_assigned_text,
-    homework_error_text, homework_completed_text, send_voice_text
+    homework_error_text, homework_completed_text, send_voice_text,
+    buttons_info_text
 )
 
 from database.models import User, Topic, MessageHistory, Homework
@@ -23,6 +25,7 @@ from handlers.sending_data import (
     save_lesson_dialog, save_homework, send_lesson_summary_to_group,
     send_homework_response_to_group, get_lesson_dialogs, update_homework_answer
 )
+from kbds.inline import get_lesson_buttons_keyboard
 
 router_user_private = Router()
 
@@ -173,18 +176,22 @@ async def handle_voice_message(message: Message, state: FSMContext, session: Asy
             "content": str(msg.content)
         })
     
-    # Проверяем, это первая итерация или вторая
-    if lesson_iteration == 1:
-        # Первая итерация - проверяем произношение и даём советы
-        await handle_first_iteration(message, state, session, user_id, user_text, current_topic, conversation_history, voice.file_id)
+    # Получаем режим чата
+    data = await state.get_data()
+    chat_mode = data.get("chat_mode", "lesson")
+    
+    # Обрабатываем голосовое сообщение (убираем ограничение на 2 итерации)
+    if chat_mode == "teacher":
+        # Режим общения с учителем
+        await handle_teacher_chat(message, state, session, user_id, user_text, conversation_history, voice.file_id)
     else:
-        # Вторая итерация - проверяем исправления
-        await handle_second_iteration(message, state, session, user_id, user_text, current_topic, conversation_history, voice.file_id)
+        # Обычный режим урока - проверяем произношение и даём советы
+        await handle_lesson_iteration(message, state, session, user_id, user_text, current_topic, conversation_history, voice.file_id, lesson_iteration)
 
 
-async def handle_first_iteration(message: Message, state: FSMContext, session: AsyncSession, user_id: int, user_text: str, current_topic: Topic, conversation_history: list, voice_file_id: str):
+async def handle_lesson_iteration(message: Message, state: FSMContext, session: AsyncSession, user_id: int, user_text: str, current_topic: Topic, conversation_history: list, voice_file_id: str, iteration: int):
     """
-    Обрабатывает первую итерацию урока
+    Обрабатывает любую итерацию урока (убираем ограничение на 2 итерации)
     """
     # Генерируем интеллектуальный ответ с проверкой
     try:
@@ -208,7 +215,7 @@ async def handle_first_iteration(message: Message, state: FSMContext, session: A
         }
     
     # Формируем ответ с обратной связью
-    response_text = f"💡 Совет\n\n{feedback.get('feedback', '')}\n\n"
+    response_text = f"💡 Обратная связь (итерация {iteration})\n\n{feedback.get('feedback', '')}\n\n"
     if not feedback.get('is_correct', True):
         response_text += f"Правильный ответ: {feedback.get('correct_answer', '')}\n\n"
         response_text += f"Объяснение: {feedback.get('explanation', '')}\n\n"
@@ -244,11 +251,80 @@ async def handle_first_iteration(message: Message, state: FSMContext, session: A
     # Отправляем обратную связь
     await message.answer(response_text)
     
-    # Создаём inline кнопку для работы над ошибками
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Работа над ошибками", callback_data="work_on_errors")]
-    ])
-    await message.answer("Повторим?", reply_markup=keyboard)
+    # Создаём inline кнопки для урока
+    keyboard = get_lesson_buttons_keyboard()
+    await message.answer(buttons_info_text, reply_markup=keyboard)
+    
+    # Сохраняем диалог в базу данных
+    await save_lesson_dialog(
+        session=session,
+        user_id=user_id,
+        user_message=user_text,
+        ai_response=ai_response,
+        voice_file_id=voice_file_id
+    )
+    
+    # Обновляем дату последнего урока
+    await session.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(last_lesson_date=datetime.utcnow())
+    )
+    
+    await session.commit()
+    
+    # Увеличиваем счетчик итераций
+    await state.update_data(lesson_iteration=iteration + 1)
+    
+    # Устанавливаем таймер ожидания (3 минуты)
+    await set_waiting_timer(message, user_id, 3, "first_reminder", session)
+
+async def handle_teacher_chat(message: Message, state: FSMContext, session: AsyncSession, user_id: int, user_text: str, conversation_history: list, voice_file_id: str):
+    """
+    Обрабатывает общение с учителем (вопросы по английскому языку)
+    """
+    # Генерируем ответ на вопрос ученика
+    try:
+        ai_response = await openai_client.send_message(
+            user_message=user_text,
+            conversation_history=conversation_history,
+            current_topic=None  # Не привязываем к конкретной теме
+        )
+    except Exception as e:
+        print(f"Ошибка при работе с OpenAI: {e}")
+        ai_response = "I'm sorry, there was an error. Please try again later."
+    
+    # Генерируем голосовое сообщение от учителя
+    try:
+        audio_bytes = await generate_speech(ai_response)
+        if audio_bytes:
+            # Сохраняем аудио в файл
+            audio_path = await save_audio_to_file(audio_bytes, f"teacher_chat_{user_id}.mp3")
+            if audio_path:
+                # Отправляем голосовое сообщение
+                await message.bot.send_voice(
+                    chat_id=user_id,
+                    voice=FSInputFile(audio_path),
+                    caption=ai_response
+                )
+                # Удаляем временный файл
+                try:
+                    os.unlink(audio_path)
+                except:
+                    pass
+            else:
+                # Если не удалось сохранить аудио, отправляем только текст
+                await message.answer(ai_response)
+        else:
+            # Если не удалось сгенерировать аудио, отправляем только текст
+            await message.answer(ai_response)
+    except Exception as e:
+        print(f"Ошибка при генерации голосового сообщения: {e}")
+        await message.answer(ai_response)
+    
+    # Создаём inline кнопки для урока
+    keyboard = get_lesson_buttons_keyboard()
+    await message.answer(buttons_info_text, reply_markup=keyboard)
     
     # Сохраняем диалог в базу данных
     await save_lesson_dialog(
@@ -271,61 +347,13 @@ async def handle_first_iteration(message: Message, state: FSMContext, session: A
     # Устанавливаем таймер ожидания (3 минуты)
     await set_waiting_timer(message, user_id, 3, "first_reminder", session)
 
-async def handle_second_iteration(message: Message, state: FSMContext, session: AsyncSession, user_id: int, user_text: str, current_topic: Topic, conversation_history: list, voice_file_id: str):
-    """
-    Обрабатывает вторую итерацию урока
-    """
-    # Генерируем интеллектуальный ответ с проверкой для второй итерации
-    try:
-        ai_response, feedback = await openai_client.generate_intelligent_response(
-            user_message=user_text,
-            conversation_history=conversation_history,
-            current_topic={
-                "title": str(current_topic.title),
-                "description": str(current_topic.description),
-                "tasks": json.loads(str(current_topic.tasks))
-            }
-        )
-    except Exception as e:
-        print(f"Ошибка при проверке ответа: {e}")
-        feedback = {
-            "is_correct": True,
-            "feedback": "Отлично! 👍 Вы улучшились!",
-            "correct_answer": user_text,
-            "explanation": ""
-        }
-        ai_response = "Great job! You've improved a lot!"
-    
-    # Отправляем согласованный ответ от бота
-    await message.answer(ai_response)
-    
-    # Формируем и отправляем обратную связь
-    response_text = f"💡 Результат второй попытки\n\n{feedback.get('feedback', '')}\n\n"
-    if not feedback.get('is_correct', True):
-        response_text += f"Правильный ответ: {feedback.get('correct_answer', '')}\n\n"
-        response_text += f"Объяснение: {feedback.get('explanation', '')}\n\n"
-    
-    await message.answer(response_text)
-    
-    # Сохраняем диалог в базу данных
-    await save_lesson_dialog(
-        session=session,
-        user_id=user_id,
-        user_message=user_text,
-        ai_response="Second iteration feedback",
-        voice_file_id=voice_file_id
-    )
-    
-    await session.commit()
-    
-    # Завершаем урок и выдаём домашнее задание
-    await give_homework(message, state, session, user_id, current_topic, conversation_history)
 
 
-@router_user_private.callback_query(F.data == "work_on_errors")
-async def work_on_errors_callback(callback, state: FSMContext):
+
+@router_user_private.callback_query(F.data == "learn_lesson")
+async def learn_lesson_callback(callback, state: FSMContext):
     """
-    Обработчик кнопки "Работа над ошибками"
+    Обработчик кнопки "Учиться по уроку" - продолжает урок
     """
     user_id = callback.from_user.id
     
@@ -334,11 +362,36 @@ async def work_on_errors_callback(callback, state: FSMContext):
         waiting_timers[user_id].cancel()
         del waiting_timers[user_id]
     
-    # Обновляем состояние для второй итерации
-    await state.update_data(lesson_iteration=2)
+    # Продолжаем урок
     await state.set_state(LessonState.waiting_for_voice)
     
-    await callback.message.answer("🎤 Отлично! Теперь повторите те же предложения, но постарайтесь исправить ошибки. Отправьте голосовое сообщение!")
+    await callback.message.answer("🎤 Отлично! Продолжаем урок. Отправьте голосовое сообщение!")
+
+@router_user_private.callback_query(F.data == "chat_with_teacher")
+async def chat_with_teacher_callback(callback, state: FSMContext):
+    """
+    Обработчик кнопки "Общаться с учителем"
+    """
+    user_id = callback.from_user.id
+    
+    # Отменяем таймер ожидания если он был
+    if user_id in waiting_timers:
+        waiting_timers[user_id].cancel()
+        del waiting_timers[user_id]
+    
+    # Обновляем состояние для общения с учителем
+    await state.update_data(chat_mode="teacher")
+    await state.set_state(LessonState.waiting_for_voice)
+    
+    await callback.message.answer("💬 Отлично! Теперь ты можешь задавать мне любые вопросы по английскому языку. Отправь голосовое сообщение с твоим вопросом!")
+
+# Оставляем старый обработчик для обратной совместимости
+@router_user_private.callback_query(F.data == "work_on_errors")
+async def work_on_errors_callback(callback, state: FSMContext):
+    """
+    Обработчик кнопки "Работа над ошибками" (для обратной совместимости)
+    """
+    await learn_lesson_callback(callback, state)
 
 
 async def set_waiting_timer(message: Message, user_id: int, minutes: int, reminder_type: str, session: AsyncSession):
@@ -444,6 +497,77 @@ async def get_next_topic(session: AsyncSession, user: User):
     )
     
     return result.scalar_one_or_none()
+
+async def finish_lesson_without_homework(
+    message: Message, 
+    state: FSMContext,
+    session: AsyncSession, 
+    user_id: int, 
+    current_topic: Topic, 
+    conversation_history: list
+):
+    """
+    Завершает урок без выдачи домашнего задания (оно будет еженедельным)
+    """
+    try:
+        # Получаем текущий прогресс пользователя
+        user_result = await session.execute(
+            select(User).where(User.id == user_id)
+        )
+        user = user_result.scalar_one_or_none()
+        
+        if user and user.id:
+            # Отмечаем тему как пройденную
+            progress_str = str(user.progress) if user.progress else "[]"
+            completed_topics = json.loads(progress_str)
+            completed_topics.append(current_topic.id)
+            new_progress = json.dumps(completed_topics)
+            
+            # Обновляем пользователя
+            await session.execute(
+                update(User)
+                .where(User.id == user_id)
+                .values(
+                    progress=new_progress,
+                    current_topic_id=None
+                )
+            )
+        
+        await session.commit()
+        
+        # Отправляем сообщение о завершении урока
+        completion_message = f"""
+🎉 Отлично! Урок по теме "{current_topic.title}" завершен!
+
+✅ Вы успешно изучили новый материал
+✅ Практиковали произношение
+✅ Получили обратную связь
+
+📚 Домашнее задание будет выдано в пятницу для закрепления материала за всю неделю.
+
+💡 Продолжайте практиковаться! Вопросы на закрепление будут приходить регулярно.
+        """
+        
+        await message.answer(completion_message)
+        
+        # Получаем диалоги урока для отправки в группу
+        lesson_dialogs = await get_lesson_dialogs(session, user_id, limit=20)
+        
+        # ВРЕМЕННО ОТКЛЮЧЕНО: Отправляем сводку урока в группу
+        # await send_lesson_summary_to_group(
+        #     bot=message.bot,
+        #     user_id=user_id,
+        #     user_name=message.from_user.full_name,
+        #     lesson_dialogs=lesson_dialogs,
+        #     homework_text="Урок завершен без домашнего задания"
+        # )
+        
+        # Очищаем состояние
+        await state.clear()
+        
+    except Exception as e:
+        print(f"Ошибка при завершении урока: {e}")
+        await message.answer("Урок завершен! Отличная работа! 😊")
 
 async def give_homework(
     message: Message, 
@@ -612,7 +736,7 @@ async def cmd_status(message: Message):
 @router_user_private.message(F.text)
 async def handle_text_message(message: Message, state: FSMContext, session: AsyncSession):
     """
-    Обработчик текстовых сообщений (для домашних заданий)
+    Обработчик текстовых сообщений (для домашних заданий и ответов на вопросы закрепления)
     """
     user_id = message.from_user.id
     text_content = message.text
@@ -631,27 +755,37 @@ async def handle_text_message(message: Message, state: FSMContext, session: Asyn
     homework = result.scalar_one_or_none()
     
     if homework:
-        # Получаем информацию о теме для контекста
-        topic_result = await session.execute(
-            select(Topic).where(Topic.id == homework.topic_id)
+        # Обрабатываем домашнее задание (существующая логика)
+        await handle_homework_response(message, state, session, user_id, text_content, homework)
+    else:
+        # Проверяем, это может быть ответ на вопрос закрепления
+        await handle_reinforcement_response(message, state, session, user_id, text_content)
+
+async def handle_homework_response(message: Message, state: FSMContext, session: AsyncSession, user_id: int, text_content: str, homework: Homework):
+    """
+    Обрабатывает ответ на домашнее задание
+    """
+    # Получаем информацию о теме для контекста
+    topic_result = await session.execute(
+        select(Topic).where(Topic.id == homework.topic_id)
+    )
+    topic = topic_result.scalar_one_or_none()
+    topic_title = topic.title if topic else "английскому языку"
+    
+    # Проверяем домашнее задание через OpenAI
+    try:
+        homework_check = await openai_client.check_homework(
+            homework_text=homework.task_text,
+            student_answer=text_content,
+            topic_title=topic_title
         )
-        topic = topic_result.scalar_one_or_none()
-        topic_title = topic.title if topic else "английскому языку"
         
-        # Проверяем домашнее задание через OpenAI
-        try:
-            homework_check = await openai_client.check_homework(
-                homework_text=homework.task_text,
-                student_answer=text_content,
-                topic_title=topic_title
-            )
-            
-            # Формируем ответ с оценкой
-            score = homework_check.get('score', 5)
-            feedback = homework_check.get('feedback', 'Спасибо за выполнение домашнего задания!')
-            grade_description = homework_check.get('grade_description', 'удовлетворительно')
-            
-            response_text = f"""
+        # Формируем ответ с оценкой
+        score = homework_check.get('score', 5)
+        feedback = homework_check.get('feedback', 'Спасибо за выполнение домашнего задания!')
+        grade_description = homework_check.get('grade_description', 'удовлетворительно')
+        
+        response_text = f"""
 📝 Проверка домашнего задания
 
 🎯 Оценка: {score}/10 ({grade_description})
@@ -660,49 +794,107 @@ async def handle_text_message(message: Message, state: FSMContext, session: Asyn
 {feedback}
 
 """
+        
+        # Добавляем грамматические ошибки, если есть
+        grammar_errors = homework_check.get('grammar_errors', [])
+        if grammar_errors:
+            response_text += f"\n❌ Грамматические ошибки:\n"
+            for error in grammar_errors:
+                response_text += f"• {error}\n"
+        
+        # Добавляем замечания по словарному запасу
+        vocabulary_notes = homework_check.get('vocabulary_notes', '')
+        if vocabulary_notes:
+            response_text += f"\n📚 Словарный запас:\n{vocabulary_notes}\n"
+        
+        # Добавляем предложения для улучшения
+        suggestions = homework_check.get('suggestions', [])
+        if suggestions:
+            response_text += f"\n💡 Предложения для улучшения:\n"
+            for suggestion in suggestions:
+                response_text += f"• {suggestion}\n"
+        
+        await message.answer(response_text)
+        
+    except Exception as e:
+        print(f"Ошибка при проверке домашнего задания: {e}")
+        await message.answer("✅ Спасибо за выполнение домашнего задания! Я проверю его и дам обратную связь.")
+    
+    # Обновляем ответ на домашнее задание
+    updated_homework = await update_homework_answer(
+        session=session,
+        user_id=user_id,
+        answer_text=text_content
+    )
+    
+    if updated_homework:
+        # Отправляем ответ на ДЗ в группу
+        await send_homework_response_to_group(
+            bot=message.bot,
+            user_id=user_id,
+            user_name=message.from_user.full_name,
+            homework_text=updated_homework.task_text,
+            user_answer=text_content
+        )
+    
+    await state.clear()  # Очищаем состояние
+
+async def handle_reinforcement_response(message: Message, state: FSMContext, session: AsyncSession, user_id: int, text_content: str):
+    """
+    Обрабатывает ответ на вопрос закрепления материала
+    """
+    try:
+        # Получаем информацию о пользователе и его текущей теме
+        user_result = await session.execute(
+            select(User).where(User.id == user_id)
+        )
+        user = user_result.scalar_one_or_none()
+        
+        if not user:
+            await message.answer("🎤 Отправьте голосовое сообщение, чтобы начать урок!")
+            return
+        
+        # Получаем текущую тему пользователя
+        current_topic = None
+        if user.current_topic_id:
+            topic_result = await session.execute(
+                select(Topic).where(Topic.id == user.current_topic_id)
+            )
+            current_topic = topic_result.scalar_one_or_none()
+        
+        # Проверяем ответ через OpenAI
+        try:
+            feedback_result = await openai_client.check_pronunciation_and_answer(
+                user_answer=text_content,
+                current_topic=current_topic,
+                context="Reinforcement question response",
+                conversation_history=[]
+            )
             
-            # Добавляем грамматические ошибки, если есть
-            grammar_errors = homework_check.get('grammar_errors', [])
-            if grammar_errors:
-                response_text += f"\n❌ Грамматические ошибки:\n"
-                for error in grammar_errors:
-                    response_text += f"• {error}\n"
-            
-            # Добавляем замечания по словарному запасу
-            vocabulary_notes = homework_check.get('vocabulary_notes', '')
-            if vocabulary_notes:
-                response_text += f"\n📚 Словарный запас:\n{vocabulary_notes}\n"
-            
-            # Добавляем предложения для улучшения
-            suggestions = homework_check.get('suggestions', [])
-            if suggestions:
-                response_text += f"\n💡 Предложения для улучшения:\n"
-                for suggestion in suggestions:
-                    response_text += f"• {suggestion}\n"
+            # Формируем ответ с обратной связью
+            response_text = f"💡 Обратная связь\n\n{feedback_result.get('feedback', '')}\n\n"
+            if not feedback_result.get('is_correct', True):
+                response_text += f"Правильный ответ: {feedback_result.get('correct_answer', '')}\n\n"
+                response_text += f"Объяснение: {feedback_result.get('explanation', '')}\n\n"
             
             await message.answer(response_text)
             
         except Exception as e:
-            print(f"Ошибка при проверке домашнего задания: {e}")
-            await message.answer("✅ Спасибо за выполнение домашнего задания! Я проверю его и дам обратную связь.")
+            print(f"Ошибка при проверке ответа на закрепление: {e}")
+            await message.answer("✅ Спасибо за ответ! Отличная работа! 😊")
         
-        # Обновляем ответ на домашнее задание
-        updated_homework = await update_homework_answer(
+        # Сохраняем диалог в базу данных
+        await save_lesson_dialog(
             session=session,
             user_id=user_id,
-            answer_text=text_content
+            user_message=text_content,
+            ai_response="Reinforcement feedback",
+            voice_file_id=None
         )
         
-        if updated_homework:
-            # Отправляем ответ на ДЗ в группу
-            await send_homework_response_to_group(
-                bot=message.bot,
-                user_id=user_id,
-                user_name=message.from_user.full_name,
-                homework_text=updated_homework.task_text,
-                user_answer=text_content
-            )
+        await session.commit()
         
-        await state.clear()  # Очищаем состояние
-    else:
-        await message.answer("🎤 Отправьте голосовое сообщение, чтобы начать урок!") 
+    except Exception as e:
+        print(f"Ошибка при обработке ответа на закрепление: {e}")
+        await message.answer("🎤 Отправьте голосовое сообщение, чтобы начать урок!")
+ 

@@ -6,7 +6,7 @@ import random
 import tempfile
 import asyncio
 import random
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -148,15 +148,44 @@ class OpenAIClient:
         
         logger.info(f"Используем OpenAI API: api_key={self.api_key[:10]}...")
         
-        # Формируем системный промпт с учётом результата проверки
-        system_prompt = self.create_system_prompt(current_topic, feedback_result)
+        # Определяем тип ответа на основе наличия темы
+        if current_topic is None:
+            # Режим общения с учителем - отвечаем на вопросы по английскому
+            return await self._send_teacher_message(user_message, conversation_history)
+        else:
+            # Режим урока - отвечаем в контексте темы
+            return await self._send_lesson_message(user_message, conversation_history, current_topic)
+
+    async def _send_teacher_message(self, user_message: str, conversation_history: List[Dict[str, str]]) -> str:
+        """
+        Отправляет сообщение в режиме общения с учителем
         
-        # Формируем сообщения для API в формате OpenAI
+        Args:
+            user_message: Сообщение пользователя
+            conversation_history: История диалога
+            
+        Returns:
+            Ответ от учителя на английском языке
+        """
+        system_prompt = """
+        Ты - дружелюбный учитель английского языка Marcus. Отвечай на вопросы ученика по английскому языку.
+        
+        Твоя задача:
+        - Отвечать на любые вопросы по английскому языку (грамматика, произношение, значения слов, идиомы и т.д.)
+        - Объяснять понятно и доступно
+        - Давать примеры использования
+        - Быть дружелюбным и поддерживающим
+        - Отвечать на английском языке с русским переводом в скобках
+        - Использовать эмодзи для живости
+        
+        Формат ответа:
+        Английский ответ "Русский перевод в скобках"
+        """
+        
         messages = [{"role": "system", "content": system_prompt}]
         
         # Добавляем историю диалога
-        for msg in conversation_history[-20:]:  # Последние 20 сообщений
-            # Конвертируем роль 'bot' в 'assistant' для OpenAI API
+        for msg in conversation_history[-10:]:  # Последние 10 сообщений
             role = "assistant" if msg["role"] == "bot" else msg["role"]
             messages.append({
                 "role": role,
@@ -168,18 +197,60 @@ class OpenAIClient:
         
         try:
             response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",  # Используем GPT-4o-mini для быстрых ответов
+                model="gpt-4o-mini",
                 messages=messages,
-                max_tokens=150,  # Ограничиваем длину ответа
+                max_tokens=200,
                 temperature=0.7,
                 timeout=30
             )
             
             return response.choices[0].message.content.strip()
-                        
+            
         except Exception as e:
-            logger.error(f"Ошибка при отправке запроса к OpenAI: {e}")
-            logger.warning("Переключаемся на fallback режим из-за ошибки API")
+            logger.error(f"Ошибка при отправке сообщения учителю: {e}")
+            return "I'm sorry, there was an error. Please try again later. (Извините, произошла ошибка. Попробуйте позже.)"
+
+    async def _send_lesson_message(self, user_message: str, conversation_history: List[Dict[str, str]], current_topic: Dict[str, Any]) -> str:
+        """
+        Отправляет сообщение в режиме урока
+        
+        Args:
+            user_message: Сообщение пользователя
+            conversation_history: История диалога
+            current_topic: Текущая тема урока
+            
+        Returns:
+            Ответ от учителя в контексте урока
+        """
+        # Используем существующую логику для уроков
+        system_prompt = self.create_system_prompt(current_topic, None)
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Добавляем историю диалога
+        for msg in conversation_history[-20:]:
+            role = "assistant" if msg["role"] == "bot" else msg["role"]
+            messages.append({
+                "role": role,
+                "content": msg["content"]
+            })
+        
+        # Добавляем текущее сообщение пользователя
+        messages.append({"role": "user", "content": user_message})
+        
+        try:
+            response = await self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=150,
+                temperature=0.7,
+                timeout=30
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            logger.error(f"Ошибка при отправке сообщения урока: {e}")
             return self._get_test_response(user_message, current_topic)
 
 
@@ -273,7 +344,24 @@ class OpenAIClient:
         # Проверяем, доступен ли OpenAI API
         if not self.api_key or self.api_key == "your_openai_api_key":
             # Fallback режим - простая проверка
-            return self._simple_answer_check(user_answer, expected_answer)
+            # Сначала определяем ожидаемый ответ, как в обычном режиме
+            if current_topic:
+                topic_tasks = current_topic.get('tasks', [])
+                if isinstance(topic_tasks, str):
+                    try:
+                        topic_tasks = json.loads(topic_tasks)
+                    except:
+                        topic_tasks = []
+                
+                # Генерируем ожидаемый ответ на основе задач темы
+                if topic_tasks and len(topic_tasks) > 0:
+                    expected_answer = topic_tasks[0]  # Берём первую задачу как пример
+                else:
+                    expected_answer = f"Answer about {current_topic.get('title', 'английскому языку')}"
+            else:
+                expected_answer = "Hello, my name is [name]. I like [hobby]."
+            
+            return self._simple_answer_check(user_answer, expected_answer, current_topic.get('title', 'английскому языку') if current_topic else 'английскому языку', "")
         
         # Генерируем контекст на основе текущей темы
         topic_title = current_topic.get('title', 'английскому языку') if current_topic else 'английскому языку'
@@ -716,11 +804,11 @@ class OpenAIClient:
                 return result
             except:
                 # Если не удалось распарсить JSON, используем простую проверку
-                return self._simple_homework_check(homework_text, student_answer)
+                return self._simple_answer_check(homework_text, student_answer)
                 
         except Exception as e:
             logger.error(f"Ошибка при проверке домашнего задания: {e}")
-            return self._simple_homework_check(homework_text, student_answer)
+            return self._simple_answer_check(homework_text, student_answer)
 
 
     async def generate_lesson_start_message(self, topic_title: str, topic_description: str) -> str:
@@ -746,7 +834,6 @@ class OpenAIClient:
         
         Формат:
         Английский текст "Русский перевод в скобках"
-        В конце всегда ставь "🎤 Отправь мне голосовое сообщение, чтобы начать урок!"
         """
         
         user_prompt = f"""
@@ -776,6 +863,83 @@ class OpenAIClient:
         except Exception as e:
             logger.error(f"Ошибка при генерации сообщения начала урока: {e}")
             return f"Hello! 👋 Ready to learn about {topic_title}? Let's start our English lesson! (Привет! Готов изучать тему '{topic_title}'? Начинаем урок английского!)"
+
+    async def generate_lesson_task(self, topic_title: str, topic_description: str, topic_tasks: list) -> str:
+        """
+        Генерирует простое задание для начала урока
+        
+        Args:
+            topic_title: Название темы
+            topic_description: Описание темы
+            topic_tasks: Список задач по теме
+            
+        Returns:
+            Текст простого задания для урока
+        """
+        system_prompt = """
+        Ты - опытный учитель английского языка Marcus. Создай ПРОСТОЕ задание для ученика по теме урока.
+        
+        ВАЖНО: Это НЕ домашнее задание! Это простое задание для начала урока.
+        
+        Задание должно быть:
+        - ОЧЕНЬ ПРОСТЫМ (максимум 1-2 предложения в ответе)
+        - Конкретным и понятным
+        - На АНГЛИЙСКОМ языке
+        - Соответствующим теме урока
+        - Выполнимым за 30 секунд
+        - Как простой вопрос в диалоге
+        
+        Формат: Один простой вопрос на английском языке
+        Примеры ПРАВИЛЬНЫХ заданий:
+        - "Tell me about your best friend in two words"
+        - "What do you like to do?"
+        - "Describe your day in one sentence"
+        - "What's your favorite hobby?"
+        
+        НЕ ДЕЛАЙ сложные задания типа:
+        - "Describe in 5-7 sentences..."
+        - "Use at least 3 adjectives..."
+        - "Write an essay about..."
+        """
+        
+        user_prompt = f"""
+        Создай ПРОСТОЕ задание для ученика по теме: "{topic_title}"
+        
+        Описание темы: {topic_description}
+        Доступные задачи: {', '.join(topic_tasks) if isinstance(topic_tasks, list) else topic_tasks}
+        
+        ВАЖНО: Это задание для начала урока, а не домашнее задание!
+        Задание должно быть очень простым - ученик должен ответить максимум 1-2 предложениями.
+        Сделай это как простой вопрос в диалоге, а не как сложную задачу.
+        """
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        try:
+            response = await self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                max_tokens=50,  # Уменьшаем для более коротких заданий
+                temperature=0.7,
+                timeout=30
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            logger.error(f"Ошибка при генерации задания урока: {e}")
+            # Fallback задание - простое
+            if isinstance(topic_tasks, list) and len(topic_tasks) > 0:
+                # Берем первое задание, но делаем его проще
+                task = topic_tasks[0]
+                if "предложениях" in task or "предложения" in task:
+                    return task.replace("в двух предложениях", "в одном предложении").replace("в нескольких предложениях", "в одном предложении")
+                return task
+            else:
+                return f"Расскажи о себе в одном предложении"
 
 
     async def generate_lesson_end_message(self, conversation_summary: str, user_name: str) -> str:
