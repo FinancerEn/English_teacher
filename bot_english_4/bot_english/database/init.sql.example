@@ -1,0 +1,82 @@
+-- Скрипт инициализации базы данных для English Assistant Bot
+-- Этот файл выполняется автоматически при первом запуске PostgreSQL контейнера
+-- 
+-- ИНСТРУКЦИЯ: Скопируйте этот файл в init.sql и замените placeholder'ы на ваши данные
+-- cp init.sql.example init.sql
+-- nano init.sql
+
+-- Даём пользователю [YOUR_DB_USER] полные права на базу данных [YOUR_DB_NAME]
+GRANT ALL PRIVILEGES ON DATABASE [YOUR_DB_NAME] TO [YOUR_DB_USER];
+
+-- Подключаемся к базе данных [YOUR_DB_NAME]
+\c [YOUR_DB_NAME];
+
+-- Даём пользователю [YOUR_DB_USER] права на создание таблиц и другие операции
+GRANT ALL PRIVILEGES ON SCHEMA public TO [YOUR_DB_USER];
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO [YOUR_DB_USER];
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO [YOUR_DB_USER];
+
+-- Устанавливаем пользователя [YOUR_DB_USER] как владельца схемы public
+ALTER SCHEMA public OWNER TO [YOUR_DB_USER];
+
+-- Создание таблиц для English Assistant Bot
+
+-- Таблица пользователей
+CREATE TABLE IF NOT EXISTS users (
+    id BIGINT PRIMARY KEY,
+    current_topic_id INTEGER,
+    last_lesson_date TIMESTAMP,
+    progress TEXT DEFAULT '[]',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Таблица тем
+CREATE TABLE IF NOT EXISTS topics (
+    id SERIAL PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    tasks JSON,
+    is_completed BOOLEAN DEFAULT FALSE
+);
+
+-- Таблица истории сообщений
+CREATE TABLE IF NOT EXISTS message_history (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(id),
+    role VARCHAR(50) NOT NULL,
+    content TEXT NOT NULL,
+    voice_file_id VARCHAR(255),
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Таблица домашних заданий
+CREATE TABLE IF NOT EXISTS homeworks (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(id),
+    topic_id INTEGER REFERENCES topics(id),
+    task_text TEXT NOT NULL,
+    answer_text TEXT,
+    is_checked BOOLEAN DEFAULT FALSE,
+    date_assigned TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    date_completed TIMESTAMP
+);
+
+-- Индексы для оптимизации
+CREATE INDEX IF NOT EXISTS idx_users_current_topic ON users(current_topic_id);
+CREATE INDEX IF NOT EXISTS idx_message_history_user_id ON message_history(user_id);
+CREATE INDEX IF NOT EXISTS idx_message_history_timestamp ON message_history(timestamp);
+CREATE INDEX IF NOT EXISTS idx_homeworks_user_id ON homeworks(user_id);
+CREATE INDEX IF NOT EXISTS idx_homeworks_is_checked ON homeworks(is_checked);
+
+-- Загрузка начальных тем уроков
+INSERT INTO topics (title, description, tasks) VALUES
+('Greetings and Introductions', 'Изучаем приветствия и представления на английском языке', '["Hello, my name is [name]. Nice to meet you!", "Hi! How are you today?", "Good morning! What''s your name?"]'),
+('Family and Relationships', 'Изучаем слова и фразы о семье и отношениях', '["This is my family. I have a mother and father.", "My sister is 25 years old. She works as a teacher.", "I love my family very much."]'),
+('Hobbies and Interests', 'Изучаем хобби и интересы на английском языке', '["I like reading books and watching movies.", "My hobby is playing guitar and singing.", "What do you like to do in your free time?"]'),
+('Food and Cooking', 'Изучаем слова о еде и готовке', '["I enjoy cooking Italian food, especially pasta.", "My favorite food is pizza with cheese and tomatoes.", "Do you like cooking? What''s your favorite dish?"]'),
+('Travel and Places', 'Изучаем слова о путешествиях и местах', '["I want to visit Paris and see the Eiffel Tower.", "My dream vacation is to go to the beach in Hawaii.", "Have you ever traveled abroad? Where did you go?"]')
+ON CONFLICT (id) DO NOTHING;
+
+-- Даём права на новые таблицы
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO [YOUR_DB_USER];
+GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO [YOUR_DB_USER];
